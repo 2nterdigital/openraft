@@ -59,6 +59,7 @@ pub mod base;
 #[cfg(feature = "compat")]
 pub mod compat;
 pub mod docs;
+pub mod election_observer;
 pub mod entry;
 pub mod errors;
 pub mod impls;

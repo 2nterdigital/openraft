@@ -100,6 +100,8 @@ use crate::core::raft_msg::install_full_snapshot_request::InstallFullSnapshotReq
 use crate::core::runtime_stats::RuntimeStats;
 use crate::core::sm;
 use crate::core::sm::worker;
+use crate::election_observer::ElectionObserver;
+use crate::election_observer::handle::ObserverHandle;
 use crate::engine::Engine;
 use crate::engine::EngineConfig;
 use crate::entry::EntryPayload;
@@ -466,8 +468,32 @@ where
         id: C::NodeId,
         config: Arc<Config>,
         network: N,
+        log_store: LS,
+        state_machine: SM,
+    ) -> Result<Self, Fatal<C>>
+    where
+        N: RaftNetworkFactory<C>,
+        N::Network: NetSnapshot<C, SnapshotData = SM::SnapshotData>,
+        LS: RaftLogStorage<C>,
+    {
+        Self::new_with_election_observer(id, config, network, log_store, state_machine, None).await
+    }
+
+    /// Construct a Raft instance with an optional native election source observer.
+    ///
+    /// The observer is installed before core startup and may receive events before this returns.
+    /// Bind application context in the observer itself. Callbacks must be bounded and nonblocking;
+    /// see [`ElectionObserver`]. `None` performs no observer collection or campaign bookkeeping and
+    /// adds no task. Algorithm, storage format, vote rules, and defaults are unchanged.
+    #[since(version = "0.10.0", change = "optional native election source observer")]
+    #[tracing::instrument(level="debug", skip_all, fields(cluster=%config.cluster_name))]
+    pub async fn new_with_election_observer<LS, N>(
+        id: C::NodeId,
+        config: Arc<Config>,
+        network: N,
         mut log_store: LS,
         mut state_machine: SM,
+        observer: Option<Arc<dyn ElectionObserver<C>>>,
     ) -> Result<Self, Fatal<C>>
     where
         N: RaftNetworkFactory<C>,
@@ -519,7 +545,9 @@ where
             helper.get_initial_state().await?
         };
 
-        let engine = Engine::new(state, eng_config);
+        let mut engine = Engine::new(state, eng_config);
+        engine.election_observer = observer.map(ObserverHandle::new);
+        engine.observe_started();
 
         let sm_span = tracing::span!(parent: &core_span, Level::DEBUG, "sm_worker");
 
