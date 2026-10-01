@@ -439,6 +439,26 @@ impl TypedRaftRouter {
         rt.insert(id, (node, log_store, sm));
     }
 
+    /// Construct through the independent public observer API using the existing real RPC router.
+    pub async fn new_raft_node_with_election_observer(
+        &mut self,
+        id: MemNodeId,
+        observer: Arc<dyn openraft::election_observer::ElectionObserver<MemConfig>>,
+    ) {
+        let (log_store, sm) = self.new_store();
+        let node = Raft::new_with_election_observer(
+            id,
+            self.config.clone(),
+            self.clone(),
+            log_store.clone(),
+            sm.clone(),
+            Some(observer),
+        )
+        .await
+        .unwrap();
+        self.nodes.lock().unwrap().insert(id, (node, log_store, sm));
+    }
+
     /// Remove the target node from the routing table & isolation.
     pub fn remove_node(&mut self, id: MemNodeId) -> Option<(MemRaft, MemLogStore, MemStateMachine)> {
         let opt_handles = {

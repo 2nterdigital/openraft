@@ -909,7 +909,7 @@ where
 
         if !has_error {
             // With the new config, start to elect to become leader
-            self.engine.elect();
+            self.engine.elect_with_origin(crate::election_observer::CampaignOrigin::Initialize);
         }
     }
 
@@ -1858,7 +1858,25 @@ where
                 if self.engine.candidate.is_some() {
                     if self.does_candidate_vote_match(&candidate_vote, "VoteResponse") {
                         self.engine.handle_vote_resp(target, resp);
+                    } else {
+                        self.engine.observe_ignored_response(
+                            Some(now),
+                            crate::election_observer::CampaignPhase::Vote,
+                            &target,
+                            &candidate_vote,
+                            &resp,
+                            crate::election_observer::VoteResponseDisposition::IgnoredStaleCampaign,
+                        );
                     }
+                } else {
+                    self.engine.observe_ignored_response(
+                        Some(now),
+                        crate::election_observer::CampaignPhase::Vote,
+                        &target,
+                        &candidate_vote,
+                        &resp,
+                        crate::election_observer::VoteResponseDisposition::IgnoredNoCampaign,
+                    );
                 }
             }
 
@@ -1877,7 +1895,25 @@ where
                 if self.engine.pre_candidate.is_some() {
                     if self.does_pre_candidate_vote_match(&candidate_vote, "PreVoteResponse") {
                         self.engine.handle_pre_vote_resp(target, resp);
+                    } else {
+                        self.engine.observe_ignored_response(
+                            None,
+                            crate::election_observer::CampaignPhase::PreVote,
+                            &target,
+                            &candidate_vote,
+                            &resp,
+                            crate::election_observer::VoteResponseDisposition::IgnoredStaleCampaign,
+                        );
                     }
+                } else {
+                    self.engine.observe_ignored_response(
+                        None,
+                        crate::election_observer::CampaignPhase::PreVote,
+                        &target,
+                        &candidate_vote,
+                        &resp,
+                        crate::election_observer::VoteResponseDisposition::IgnoredNoCampaign,
+                    );
                 }
             }
 
@@ -2039,7 +2075,8 @@ where
             return;
         }
 
-        if !self.runtime_config.enable_elect.load(Ordering::Relaxed) {
+        let election_enabled = self.runtime_config.enable_elect.load(Ordering::Relaxed);
+        if !election_enabled {
             tracing::debug!("skip election, election disabled");
             return;
         }
@@ -2075,7 +2112,8 @@ where
 
         // Pre-Vote (multi-voter only): probe a quorum before incrementing the term.
         // A single voter always wins its own Pre-Vote, so it elects directly.
-        let pre_vote = self.runtime_config.enable_pre_vote.load(Ordering::Relaxed) && voter_count > 1;
+        let pre_vote_enabled = self.runtime_config.enable_pre_vote.load(Ordering::Relaxed);
+        let pre_vote = pre_vote_enabled && voter_count > 1;
 
         if pre_vote {
             // A Pre-Vote does not advance `vote.last_update_time`, so without this guard a node
@@ -2090,14 +2128,21 @@ where
         }
 
         // Every time elect, reset this flag.
+        self.engine.observe_automatic(
+            now,
+            crate::election_observer::AutomaticElectionDecision::Campaign,
+            Some(election_enabled),
+            Some(pre_vote_enabled),
+            voter_count,
+        );
         self.engine.reset_greater_log();
 
         if pre_vote {
             tracing::info!("trigger pre-vote");
-            self.engine.pre_elect();
+            self.engine.pre_elect_with_origin(crate::election_observer::CampaignOrigin::AutomaticTimeout);
         } else {
             tracing::info!("trigger election");
-            self.engine.elect();
+            self.engine.elect_with_origin(crate::election_observer::CampaignOrigin::AutomaticTimeout);
         }
     }
 
