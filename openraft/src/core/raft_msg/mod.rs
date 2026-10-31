@@ -92,6 +92,7 @@ where C: RaftTypeConfig
     },
 
     ChangeMembership {
+        guard: Option<crate::MembershipChangeGuard<C>>,
         changes: ChangeMembers<C::NodeId, C::Node>,
 
         /// If `retain` is `true`, then the voters that are not in the new

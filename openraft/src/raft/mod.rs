@@ -491,9 +491,45 @@ where
         id: C::NodeId,
         config: Arc<Config>,
         network: N,
+        log_store: LS,
+        state_machine: SM,
+        observer: Option<Arc<dyn ElectionObserver<C>>>,
+    ) -> Result<Self, Fatal<C>>
+    where
+        N: RaftNetworkFactory<C>,
+        N::Network: NetSnapshot<C, SnapshotData = SM::SnapshotData>,
+        LS: RaftLogStorage<C>,
+    {
+        Self::new_with_election_observer_and_membership_policy(
+            id,
+            config,
+            network,
+            log_store,
+            state_machine,
+            observer,
+            crate::MembershipChangePolicy::Unrestricted,
+        )
+        .await
+    }
+
+    /// Construct a Raft instance with an immutable membership authorization policy.
+    ///
+    /// The policy is installed before any API dispatch, including during storage recovery.
+    /// The application must restore the persisted policy before constructing each instance.
+    /// Pristine initialization remains available and requires separate application authorization.
+    ///
+    /// # Errors
+    /// Returns a fatal error if storage recovery or core startup fails.
+    #[since(version = "0.10.0", change = "construction-only membership authorization policy")]
+    #[tracing::instrument(level="debug", skip_all, fields(cluster=%config.cluster_name))]
+    pub async fn new_with_election_observer_and_membership_policy<LS, N>(
+        id: C::NodeId,
+        config: Arc<Config>,
+        network: N,
         mut log_store: LS,
         mut state_machine: SM,
         observer: Option<Arc<dyn ElectionObserver<C>>>,
+        membership_policy: crate::MembershipChangePolicy,
     ) -> Result<Self, Fatal<C>>
     where
         N: RaftNetworkFactory<C>,
@@ -573,6 +609,7 @@ where
             id: id.clone(),
             config: config.clone(),
             runtime_config: runtime_config.clone(),
+            membership_policy,
             core_state: Default::default(),
             network_factory: network,
             log_store,

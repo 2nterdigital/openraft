@@ -101,6 +101,7 @@ where C: RaftTypeConfig
 }
 
 /// The set of errors which may take place when requesting to propose a config change.
+#[since(version = "0.10.0", change = "membership authorization rejection")]
 #[since(
     version = "0.10.0",
     change = "from `ChangeMembershipError<C>` to `ChangeMembershipError<CLID, NID>`"
@@ -112,6 +113,14 @@ where
     CLID: RaftCommittedLeaderId,
     NID: NodeId,
 {
+    /// This instance requires a guard for every membership mutation.
+    #[error("membership change requires a guard")]
+    GuardRequired,
+
+    /// The expected leader or exact committed/effective membership no longer matches.
+    #[error("membership change guard does not match current state")]
+    GuardMismatch,
+
     /// A membership change is already in progress.
     #[error(transparent)]
     InProgress(#[from] InProgress<CLID>),

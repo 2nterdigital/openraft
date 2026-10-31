@@ -80,6 +80,7 @@ where C: RaftTypeConfig
             .inner
             .call_core(
                 RaftMsg::ChangeMembership {
+                    guard: None,
                     changes: changes.clone(),
                     retain,
                     tx,
@@ -116,7 +117,18 @@ where C: RaftTypeConfig
 
         // The second step, send a NOOP change to flatten the joint config.
         let changes = ChangeMembers::AddVoterIds(Default::default());
-        let client_write_result = self.inner.call_core(RaftMsg::ChangeMembership { changes, retain, tx }, rx).await?;
+        let client_write_result = self
+            .inner
+            .call_core(
+                RaftMsg::ChangeMembership {
+                    guard: None,
+                    changes,
+                    retain,
+                    tx,
+                },
+                rx,
+            )
+            .await?;
 
         tracing::info!(
             "result of second step of change_membership: {}",
@@ -130,6 +142,26 @@ where C: RaftTypeConfig
         Ok(client_write_result)
     }
 
+    pub(crate) async fn change_membership_guarded(
+        &self,
+        members: impl Into<ChangeMembers<C::NodeId, C::Node>>,
+        retain: bool,
+        guard: crate::MembershipChangeGuard<C>,
+    ) -> Result<ClientWriteResult<C>, Fatal<C>> {
+        let (tx, rx) = new_responder_pair::<C, _>();
+        self.inner
+            .call_core(
+                RaftMsg::ChangeMembership {
+                    guard: Some(guard),
+                    changes: members.into(),
+                    retain,
+                    tx,
+                },
+                rx,
+            )
+            .await
+    }
+
     #[since(version = "0.10.0")]
     #[tracing::instrument(level = "debug", skip(self, id), fields(target=display(&id)))]
     pub(crate) async fn add_learner(
@@ -141,6 +173,7 @@ where C: RaftTypeConfig
         let (tx, rx) = new_responder_pair::<C, _>();
 
         let msg = RaftMsg::ChangeMembership {
+            guard: None,
             changes: ChangeMembers::AddNodes(btreemap! {id.clone()=>node}),
             retain: true,
             tx,

@@ -23,6 +23,8 @@
 mod into_nodes;
 #[allow(clippy::module_inception)]
 mod membership;
+mod membership_change_guard;
+mod membership_change_policy;
 mod membership_impl_quorum_set;
 mod stored_membership;
 
@@ -37,4 +39,6 @@ mod stored_membership_test;
 
 pub use into_nodes::IntoNodes;
 pub use membership::Membership;
+pub use membership_change_guard::MembershipChangeGuard;
+pub use membership_change_policy::MembershipChangePolicy;
 pub use stored_membership::StoredMembership;

@@ -179,6 +179,8 @@ where
 
     pub(crate) runtime_config: Arc<RuntimeConfig>,
 
+    pub(crate) membership_policy: crate::MembershipChangePolicy,
+
     /// Additional state that does not directly affect the consensus.
     pub(crate) core_state: CoreState<C>,
 
@@ -580,8 +582,30 @@ where
         &mut self,
         changes: ChangeMembers<C::NodeId, C::Node>,
         retain: bool,
+        guard: Option<crate::MembershipChangeGuard<C>>,
         tx: ProgressResponder<C, ClientWriteResult<C>>,
     ) {
+        // No await or dispatch occurs between authorization and the membership append below.
+        let rejection = match guard {
+            None if self.membership_policy == crate::MembershipChangePolicy::RequireGuard => {
+                Some(crate::errors::ChangeMembershipError::GuardRequired)
+            }
+            Some(guard)
+                if {
+                    let state = &self.engine.state;
+                    state.vote_ref().try_to_committed_leader_id().as_ref() != Some(&guard.expected_leader)
+                        || state.membership_state.committed().as_ref() != &guard.committed
+                        || state.membership_state.effective().as_ref() != &guard.effective
+                } =>
+            {
+                Some(crate::errors::ChangeMembershipError::GuardMismatch)
+            }
+            _ => None,
+        };
+        if let Some(error) = rejection {
+            tx.on_complete(Err(ClientWriteError::ChangeMembershipError(error)));
+            return;
+        }
         let res = self.engine.state.membership_state.change_handler().apply(changes, retain);
         let new_membership = match res {
             Ok(x) => x,
@@ -1701,7 +1725,12 @@ where
 
                 self.handle_initialize(members, tx);
             }
-            RaftMsg::ChangeMembership { changes, retain, tx } => {
+            RaftMsg::ChangeMembership {
+                guard,
+                changes,
+                retain,
+                tx,
+            } => {
                 tracing::info!(
                     "received RaftMsg::ChangeMembership: {}, members: {:?}, retain: {:?}",
                     func_name!(),
@@ -1709,7 +1738,7 @@ where
                     retain
                 );
 
-                self.change_membership(changes, retain, tx);
+                self.change_membership(changes, retain, guard, tx);
             }
             RaftMsg::WithRaftState { req } => {
                 req(&self.engine.state);
