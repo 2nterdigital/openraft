@@ -265,6 +265,36 @@ Exercise additional care when:
 
 
 
+
+### Application-authorized membership changes
+
+Construct controlled groups with
+[`Raft::new_with_election_observer_and_membership_policy()`](crate::Raft::new_with_election_observer_and_membership_policy) and
+[`MembershipChangePolicy::RequireGuard`](crate::MembershipChangePolicy::RequireGuard).
+The policy is immutable for the instance lifetime and rejects legacy `add_learner`,
+`change_membership` and `append_membership` mutations from the first core dispatch. Persist the group policy in the
+application and restore it before constructing Raft on every restart. Pristine initialization
+still requires explicit application bootstrap authorization.
+
+[`Raft::change_membership_guarded()`](crate::Raft::change_membership_guarded) appends exactly one membership step. Its
+[`MembershipChangeGuard`](crate::MembershipChangeGuard) carries a fixed committed leader identity
+and exact committed and effective memberships, including their log IDs and full configurations.
+The core compares all identities synchronously before building and appending the new membership,
+and before its leader and `UncommittedLeaderLog` checks. Use it rather than `change_membership_if`,
+whose preconditions compare log IDs only and which proposes both steps.
+A mismatch returns `ChangeMembershipError::GuardMismatch` without appending.
+
+Use `ChangeMembers::AddNodes` for learners. A voter-set change leaves a committed joint
+configuration, even when an unguarded change could skip it because every old quorum intersects
+every new one. Observe and authorize that joint state, then explicitly finalize it with
+`ChangeMembers::AddVoterIds(Default::default())` and refreshed membership snapshots, keeping the
+original expected leader identity. Recovery from an interrupted joint transition follows the same
+explicit process. The forced joint step applies only from a uniform built-in `Membership`: from a
+joint configuration, a voter target other than finalizing or reverting, and any change under a
+custom `C::Membership`, follow the unguarded transition rules. The application must serialize its authorization ledger and membership requests,
+and retain ownership of submitted futures until the response or a definitive shutdown drain.
+
+
 ## See Also
 
 - [`joint_consensus`]: Details on the two-phase membership change protocol

@@ -180,6 +180,46 @@ fn test_removed_leader_step_down_serde_default() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A config serialized before `broadcast_commit` existed keeps broadcasting commit.
+#[cfg(feature = "serde")]
+#[test]
+fn test_broadcast_commit_serde_default() -> anyhow::Result<()> {
+    let mut value = serde_json::to_value(Config::default())?;
+    value.as_object_mut().unwrap().remove("broadcast_commit");
+
+    let cfg: Config = serde_json::from_value(value)?;
+    assert!(cfg.broadcast_commit);
+
+    Ok(())
+}
+
+#[test]
+fn test_broadcast_commit_requires_heartbeat() {
+    assert!(Config::default().broadcast_commit);
+
+    let base = Config {
+        broadcast_commit: false,
+        ..Default::default()
+    };
+    assert!(base.clone().validate().is_ok());
+
+    for config in [
+        Config {
+            enable_heartbeat: false,
+            ..base.clone()
+        },
+        Config {
+            enable_tick: false,
+            ..base.clone()
+        },
+    ] {
+        assert_eq!(
+            config.validate().unwrap_err(),
+            ConfigError::BroadcastCommitWithoutHeartbeat
+        );
+    }
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn test_reset_backoff_on_transfer_leader_serde_default() -> anyhow::Result<()> {

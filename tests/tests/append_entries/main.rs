@@ -14,6 +14,7 @@ mod t11_append_inconsistent_log;
 mod t11_append_updates_membership;
 mod t12_conflict_hint;
 mod t30_replication_1_voter_to_isolated_learner;
+mod t60_broadcast_commit_off;
 mod t60_enable_heartbeat;
 mod t60_enable_tick;
 mod t61_heartbeat_reject_vote;

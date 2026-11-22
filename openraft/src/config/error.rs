@@ -32,6 +32,11 @@ pub enum ConfigError {
     #[error("max_payload_entries must be > 0")]
     MaxPayloadIs0,
 
+    /// `broadcast_commit = false` relies on heartbeats to deliver the commit index to followers.
+    #[since(version = "0.10.1")]
+    #[error("broadcast_commit=false requires enable_tick=true and enable_heartbeat=true")]
+    BroadcastCommitWithoutHeartbeat,
+
     /// Election timeout must be greater than heartbeat interval.
     #[error("election_timeout_min({election_timeout_min}) must be > heartbeat_interval({heartbeat_interval})")]
     ElectionTimeoutLTHeartBeat {

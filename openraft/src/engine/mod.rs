@@ -31,6 +31,7 @@ mod command_kind;
 mod command_name;
 mod command_scheduler;
 mod election_deadline;
+mod election_observation;
 mod engine_config;
 mod engine_impl;
 mod engine_output;
@@ -52,6 +53,7 @@ mod tests {
     mod elect_if_due_test;
     mod elect_test;
     mod election_deadline_test;
+    mod election_observer_test;
     mod handle_pre_vote_req_test;
     mod handle_pre_vote_resp_test;
     mod handle_vote_req_test;

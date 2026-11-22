@@ -103,6 +103,7 @@ where C: RaftTypeConfig
             .inner
             .call_core(
                 RaftMsg::ChangeMembership {
+                    guard: None,
                     changes,
                     payloads,
                     retain,
@@ -218,6 +219,39 @@ where C: RaftTypeConfig
         self.inner.call_core(msg, rx).await
     }
 
+    /// Append exactly one membership entry: a joint one or a uniform one, as `RaftCore`
+    /// computes it. No second step follows; the caller finalizes a joint one with a fresh guard.
+    pub(crate) async fn change_membership_guarded(
+        &self,
+        members: impl Into<MembershipEditOf<C>>,
+        retain: bool,
+        guard: crate::MembershipChangeGuard<C>,
+    ) -> Result<ClientWriteResult<C>, Fatal<C>> {
+        let (tx, rx) = ProgressResponder::<C, _>::complete_only();
+
+        // This single step ignores the target `RaftCore` sends back for a second step.
+        let (unused_tx, _unused_rx) = C::oneshot();
+        let payloads = MembershipPayloads::JointOrUniform {
+            joint: C::Payload::blank(),
+            uniform: C::Payload::blank(),
+            unused_tx,
+        };
+
+        self.inner
+            .call_core(
+                RaftMsg::ChangeMembership {
+                    guard: Some(guard),
+                    changes: members.into(),
+                    payloads,
+                    retain,
+                    preconditions: Batch::of([]),
+                    tx,
+                },
+                rx,
+            )
+            .await
+    }
+
     #[since(version = "0.10.0")]
     #[tracing::instrument(level = "debug", skip(self, id), fields(target=display(&id)))]
     pub(crate) async fn add_learner(
@@ -232,6 +266,7 @@ where C: RaftTypeConfig
         let (tx, rx) = ProgressResponder::<C, _>::complete_only();
 
         let msg = RaftMsg::ChangeMembership {
+            guard: None,
             changes: <MembershipEditOf<C> as RaftMembershipEditOps<C::Membership>>::add_learner(id.clone(), node),
             payloads: MembershipPayloads::Uniform(C::Payload::blank()),
             retain: true,

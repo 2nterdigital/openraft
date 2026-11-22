@@ -29,6 +29,8 @@ pub mod errors;
 mod into_nodes;
 #[allow(clippy::module_inception)]
 mod membership;
+mod membership_change_guard;
+mod membership_change_policy;
 mod membership_impl_quorum_set;
 mod membership_impl_raft_membership;
 mod stored_membership;
@@ -40,6 +42,8 @@ mod stored_membership_test;
 
 pub use into_nodes::IntoNodes;
 pub use membership::Membership;
+pub use membership_change_guard::MembershipChangeGuard;
+pub use membership_change_policy::MembershipChangePolicy;
 pub use node_ref::NodeRef;
 pub use node_role::NodeRole;
 use openraft_macros::since;

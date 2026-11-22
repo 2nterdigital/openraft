@@ -157,6 +157,20 @@ fn test_config_broadcast_submitted_on_append() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_config_broadcast_commit() -> anyhow::Result<()> {
+    let config = Config::build(&["foo", "--broadcast-commit=false"])?;
+    assert_eq!(false, config.broadcast_commit);
+
+    let config = Config::build(&["foo", "--broadcast-commit"])?;
+    assert_eq!(true, config.broadcast_commit);
+
+    let config = Config::build(&["foo"])?;
+    assert_eq!(true, config.broadcast_commit);
+
+    Ok(())
+}
+
+#[test]
 fn test_config_enable_heartbeat() -> anyhow::Result<()> {
     let config = Config::build(&["foo", "--enable-heartbeat=false"])?;
     assert_eq!(false, config.enable_heartbeat);
