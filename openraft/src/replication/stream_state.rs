@@ -182,6 +182,14 @@ where
                     }
                     Select4::Fourth(_) => {
                         tracing::debug!("committed_rx changed");
+                        if !self.replication_context.config.broadcast_commit {
+                            // Commit alone is delivered by the next data append or heartbeat:
+                            // `next_request()` reads the latest commit when it builds a request.
+                            // Mark it seen, or `changed()` resolves again at once. The unselected
+                            // futures are dropped unresolved, so their changes stay unseen.
+                            self.event_watcher.committed_rx.borrow_and_update();
+                            continue;
+                        }
                         // Only a commit that no request has carried is still unseen here, because
                         // `next_request()` marks every commit it sends. With no new logs to
                         // piggyback on, an entry-less request is the only way to deliver it.

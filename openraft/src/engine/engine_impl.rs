@@ -8,6 +8,12 @@ use crate::RaftTypeConfig;
 use crate::core::ServerState;
 use crate::core::raft_msg::AppendEntriesTx;
 use crate::display_ext::DisplayInstantExt;
+use crate::election_observer::AutomaticElectionDecision;
+use crate::election_observer::CampaignOrigin;
+use crate::election_observer::CampaignPhase;
+use crate::election_observer::VoteRequestDisposition;
+use crate::election_observer::VoteResponseDisposition;
+use crate::election_observer::handle::ObserverHandle;
 use crate::engine::Command;
 use crate::engine::Condition;
 use crate::engine::ElectionDeadline;
@@ -81,6 +87,9 @@ where
 {
     pub(crate) config: EngineConfig<C>,
 
+    /// Optional source-only observer. Never used to decide consensus transitions.
+    pub(crate) election_observer: Option<ObserverHandle<C>>,
+
     /// The state of this raft node.
     pub(crate) state: Valid<RaftState<C>>,
 
@@ -121,6 +130,7 @@ where
     pub(crate) fn new(init_state: RaftState<C>, config: EngineConfig<C>) -> Self {
         Self {
             config,
+            election_observer: None,
             state: Valid::new(init_state),
             seen_greater_log: None,
             leader: None,
@@ -261,7 +271,11 @@ where
     /// Start to elect this node as leader
     #[tracing::instrument(level = "debug", skip(self))]
     pub(crate) fn elect(&mut self) {
-        self.do_elect(None);
+        self.elect_with_origin(CampaignOrigin::ExternalElect);
+    }
+
+    pub(crate) fn elect_with_origin(&mut self, origin: CampaignOrigin) {
+        self.do_elect(None, origin);
     }
 
     /// Start an election as part of a leadership transfer authorized by the Leader whose vote is
@@ -271,10 +285,10 @@ where
     /// even when the leader lease has not expired. See: Raft dissertation, section 4.2.3.
     #[tracing::instrument(level = "debug", skip(self))]
     pub(crate) fn elect_by_leadership_transfer(&mut self, from: VoteOf<C>) {
-        self.do_elect(Some(from));
+        self.do_elect(Some(from), CampaignOrigin::LeadershipTransfer);
     }
 
-    fn do_elect(&mut self, leadership_transfer_from: Option<VoteOf<C>>) {
+    fn do_elect(&mut self, leadership_transfer_from: Option<VoteOf<C>>, origin: CampaignOrigin) {
         // An election attempt supersedes any in-flight Pre-Vote round.
         self.pre_candidate = None;
 
@@ -294,6 +308,7 @@ where
 
         // A real campaign consumes the timeout selected before it. Sample the
         // timeout that will gate the next campaign before entering this one.
+        let previous_timeout = self.config.timer_config.election_timeout;
         self.config.resample_election_timeout();
 
         let new_term = self.state.vote.term().next();
@@ -305,6 +320,9 @@ where
         tracing::info!("{}: new candidate: {}", func_name!(), candidate);
 
         let last_log_id = candidate.last_log_id().cloned();
+        let started = candidate.starting_time();
+
+        self.observe_campaign(started, CampaignPhase::Vote, origin, &new_vote, previous_timeout);
 
         // Simulate sending RequestVote RPC to local node.
         // Safe unwrap(): it won't reject itself ˙–˙
@@ -333,6 +351,10 @@ where
     /// would reject. [`elect`](Self::elect) remains the forced override.
     #[tracing::instrument(level = "debug", skip(self))]
     pub(crate) fn pre_elect(&mut self) {
+        self.pre_elect_with_origin(CampaignOrigin::ExternalElect);
+    }
+
+    pub(crate) fn pre_elect_with_origin(&mut self, origin: CampaignOrigin) {
         let now = C::now();
         let leased_vote = &self.state.vote;
 
@@ -348,6 +370,7 @@ where
 
         // Pre-Vote does not advance the persisted vote timestamp. Give every
         // new Pre-Vote round a fresh timeout instead of retaining one sample.
+        let previous_timeout = self.config.timer_config.election_timeout;
         self.config.resample_election_timeout();
 
         let new_term = self.state.vote.term().next();
@@ -358,13 +381,18 @@ where
         tracing::info!("{}: new pre-candidate: {}", func_name!(), pre_candidate);
 
         let last_log_id = pre_candidate.last_log_id().cloned();
+        let started = pre_candidate.starting_time();
+
+        self.observe_campaign(started, CampaignPhase::PreVote, origin, &pre_vote, previous_timeout);
 
         // Grant the Pre-Vote to itself. A single-voter cluster reaches a quorum at once and proceeds
         // directly to a real election, without an unnecessary network round-trip.
         let id = self.config.id.clone();
         let quorum_granted = self.pre_candidate.as_mut().unwrap().grant_by(&id);
+        self.observe_pre_vote_self_grant(quorum_granted);
         if quorum_granted {
-            self.elect();
+            self.observe_quorum(CampaignPhase::PreVote);
+            self.elect_with_origin(origin);
             return;
         }
 
@@ -403,6 +431,7 @@ where
     #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) fn handle_vote_req(&mut self, req: VoteRequest<C>) -> VoteResponse<C> {
         let now = C::now();
+        let observation = self.observed_request_context();
         let local_leased_vote = &self.state.vote;
 
         tracing::info!("handle vote request: req: {}", req);
@@ -432,6 +461,13 @@ where
                     local_leased_vote.display_lease_info(now)
                 );
 
+                self.observe_request(
+                    now,
+                    CampaignPhase::Vote,
+                    &req,
+                    observation,
+                    VoteRequestDisposition::LeaseNotExpired,
+                );
                 return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
             }
         }
@@ -445,6 +481,13 @@ where
             && leader.is_lease_valid(self.config.timer_config.leader_lease)
         {
             tracing::info!("reject vote-request: quorum-ack lease has not yet expired");
+            self.observe_request(
+                now,
+                CampaignPhase::Vote,
+                &req,
+                observation,
+                VoteRequestDisposition::LeaseNotExpired,
+            );
             return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
         }
 
@@ -463,6 +506,13 @@ where
 
             // Return the updated vote, this way the candidate knows which vote is granted, in case
             // the candidate's vote is changed after sending the vote request.
+            self.observe_request(
+                now,
+                CampaignPhase::Vote,
+                &req,
+                observation,
+                VoteRequestDisposition::LogBehind,
+            );
             return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
         }
 
@@ -471,6 +521,12 @@ where
         let res = self.vote_handler().update_vote(&req.vote);
 
         tracing::info!("handle vote request result: req: {}, result: {:?}", req, res);
+        let disposition = if res.is_ok() {
+            VoteRequestDisposition::Granted
+        } else {
+            VoteRequestDisposition::VoteRejected
+        };
+        self.observe_request(now, CampaignPhase::Vote, &req, observation, disposition);
 
         // Return the updated vote, this way the candidate knows which vote is granted, in case
         // the candidate's vote is changed after sending the vote request.
@@ -487,6 +543,7 @@ where
     #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) fn handle_pre_vote_req(&mut self, req: VoteRequest<C>) -> VoteResponse<C> {
         let now = C::now();
+        let observation = self.observed_request_context();
         let local_leased_vote = &self.state.vote;
 
         tracing::info!(
@@ -501,6 +558,13 @@ where
         // would not grant a vote, so it would not grant a Pre-Vote either.
         if local_leased_vote.is_committed() && !local_leased_vote.is_expired(now, Duration::from_millis(0)) {
             tracing::info!("reject pre-vote-request: leader lease has not yet expired");
+            self.observe_request(
+                now,
+                CampaignPhase::PreVote,
+                &req,
+                observation,
+                VoteRequestDisposition::LeaseNotExpired,
+            );
             return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
         }
 
@@ -510,6 +574,13 @@ where
             && leader.is_lease_valid(self.config.timer_config.leader_lease)
         {
             tracing::info!("reject pre-vote-request: quorum-ack lease has not yet expired");
+            self.observe_request(
+                now,
+                CampaignPhase::PreVote,
+                &req,
+                observation,
+                VoteRequestDisposition::LeaseNotExpired,
+            );
             return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
         }
 
@@ -520,12 +591,25 @@ where
                 req.last_log_id.display(),
                 self.state.last_log_id().display(),
             );
+            self.observe_request(
+                now,
+                CampaignPhase::PreVote,
+                &req,
+                observation,
+                VoteRequestDisposition::LogBehind,
+            );
             return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
         }
 
         // Whether this node *would* grant the vote, compared the same way as a real vote — but
         // without persisting anything. The local vote and term are left untouched.
         let granted = req.vote.as_ref_vote() >= self.state.vote_ref().as_ref_vote();
+        let disposition = if granted {
+            VoteRequestDisposition::Granted
+        } else {
+            VoteRequestDisposition::VoteRejected
+        };
+        self.observe_request(now, CampaignPhase::PreVote, &req, observation, disposition);
         VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), granted)
     }
 
@@ -548,15 +632,18 @@ where
 
         // If resp.vote is different, it may be a delay response to previous voting.
         if resp.vote_granted && &resp.vote == candidate.vote_ref() {
-            let quorum_granted = candidate.grant_by(&target);
+            let (quorum_granted, consumed) = candidate.grant_by_with_status(&target);
+            self.observe_consumed_response(CampaignPhase::Vote, &target, &resp, quorum_granted, consumed);
             if quorum_granted {
                 tracing::info!("a quorum granted my vote");
+                self.observe_quorum(CampaignPhase::Vote);
                 self.establish_leader();
             }
             return;
         }
 
         // If not equal, vote is rejected:
+        self.observe_response(CampaignPhase::Vote, &target, &resp, VoteResponseDisposition::Rejected);
 
         // Note that it is still possible seeing a smaller vote:
         // - The target has more logs than this node;
@@ -622,15 +709,24 @@ where
         // response, the responder does not adopt the candidate's vote, so the grant is read from
         // `vote_granted` rather than by comparing votes.
         if resp.vote_granted {
-            let quorum_granted = self.pre_candidate.as_mut().unwrap().grant_by(&target);
+            let (quorum_granted, consumed) = self.pre_candidate.as_mut().unwrap().grant_by_with_status(&target);
+            self.observe_consumed_response(CampaignPhase::PreVote, &target, &resp, quorum_granted, consumed);
             if quorum_granted {
                 tracing::info!("a quorum would grant the vote; starting a real election");
-                self.elect();
+                self.observe_quorum(CampaignPhase::PreVote);
+                let origin = self.observed_pre_vote_origin();
+                self.elect_with_origin(origin);
             }
             return;
         }
 
         // Rejected. If the responder has a longer log, delay the next election attempt.
+        self.observe_response(
+            CampaignPhase::PreVote,
+            &target,
+            &resp,
+            VoteResponseDisposition::Rejected,
+        );
         if resp.last_log_id.as_ref() > self.state.last_log_id() {
             tracing::info!(
                 "{}: seen a greater log id during pre-vote: {}",
@@ -993,6 +1089,7 @@ where
         let _res = self.vote_handler().update_vote(&vote.clone().into_vote());
         debug_assert!(_res.is_ok(), "commit vote cannot fail but: {:?}", _res);
 
+        self.observe_leader(&vote);
         self.state.accept_log_io(IOId::new_log_io(vote, last_log_id));
 
         // No need to submit UpdateIOProgress command,
@@ -1122,6 +1219,12 @@ where
         })
     }
 
+    /// Test shorthand for [`Self::elect_if_due_with_origin`] from the deadline notifier.
+    #[cfg(test)]
+    pub(crate) fn elect_if_due(&mut self, now: InstantOf<C>, enable_elect: bool, enable_pre_vote: bool) {
+        self.elect_if_due_with_origin(now, enable_elect, enable_pre_vote, CampaignOrigin::AutomaticTimeout);
+    }
+
     /// Start a Pre-Vote or a real election if this node may campaign and its election is due at
     /// `now`.
     ///
@@ -1131,8 +1234,16 @@ where
     /// committed membership, `enable_elect` must be on, and [`Self::election_deadline`] must be
     /// due at `now`. A node other than the single campaigner starts with a Pre-Vote round when
     /// `enable_pre_vote` is on.
+    ///
+    /// `origin` is reported only to the election observer; it never changes the decision.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub(crate) fn elect_if_due(&mut self, now: InstantOf<C>, enable_elect: bool, enable_pre_vote: bool) {
+    pub(crate) fn elect_if_due_with_origin(
+        &mut self,
+        now: InstantOf<C>,
+        enable_elect: bool,
+        enable_pre_vote: bool,
+        origin: CampaignOrigin,
+    ) {
         tracing::debug!("check whether an election is due, now: {}", now.display());
 
         if self.state.server_state == ServerState::Leader {
@@ -1179,15 +1290,22 @@ where
             tracing::info!("election timeout expired, triggering election: {}", deadline);
         }
 
+        self.observe_automatic(
+            now,
+            AutomaticElectionDecision::Campaign,
+            Some(enable_elect),
+            Some(enable_pre_vote),
+        );
+
         // Every time elect, reset this flag.
         self.reset_greater_log();
 
         if pre_vote {
             tracing::info!("trigger pre-vote");
-            self.pre_elect();
+            self.pre_elect_with_origin(origin);
         } else {
             tracing::info!("trigger election");
-            self.elect();
+            self.elect_with_origin(origin);
         }
     }
 

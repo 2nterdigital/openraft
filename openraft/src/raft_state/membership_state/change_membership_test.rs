@@ -188,3 +188,32 @@ fn test_next_membership_batch_takes_two_steps() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// `force_joint` turns a direct voter change from a uniform membership into its joint step, and
+/// leaves leaving a joint and voter-preserving changes direct; without it nothing changes.
+#[test]
+fn test_next_membership_with_force_joint() -> anyhow::Result<()> {
+    let mem =
+        |configs: Vec<std::collections::BTreeSet<u64>>| Membership::<u64, ()>::new_with_defaults(configs, [1, 2, 3]);
+    let next = |m: &Membership<u64, ()>, change: ChangeMembers<u64, ()>, force_joint: bool| {
+        let state = MembershipStateOf::<UTConfig>::new(effmem(3, 4, m.clone()), effmem(3, 4, m.clone()));
+        state.next_membership_with::<_, anyerror::AnyError>(change, true, force_joint)
+    };
+    let m12 = mem(vec![btreeset! {1,2}]);
+    let m13 = mem(vec![btreeset! {1,3}]);
+    let m12_13 = mem(vec![btreeset! {1,2}, btreeset! {1,3}]);
+
+    // {1,2} -> {1,3}: both majorities contain 1, so the step is direct unless forced.
+    let replace = || ChangeMembers::ReplaceAllVoters(btreeset! {1,3});
+    assert_eq!(Ok((m13.clone(), None)), next(&m12, replace(), false));
+    assert_eq!(Ok((m12_13.clone(), Some(m13.clone()))), next(&m12, replace(), true));
+
+    // Leaving the joint stays direct.
+    let finalize = || ChangeMembers::AddVoterIds(btreeset! {});
+    assert_eq!(Ok((m13.clone(), None)), next(&m12_13, finalize(), true));
+
+    // A change that keeps the voters stays direct.
+    assert_eq!(Ok((m12.clone(), None)), next(&m12, finalize(), true));
+
+    Ok(())
+}

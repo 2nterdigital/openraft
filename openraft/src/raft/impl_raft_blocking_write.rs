@@ -333,6 +333,41 @@ where
             .into_raft_result()
     }
 
+    /// Append exactly one membership step under an exact leader and membership guard.
+    ///
+    /// Use `ChangeMembers::AddNodes` to add learners. A voter change proposes only the joint
+    /// configuration; it does not automatically propose its final uniform configuration, even when
+    /// every old quorum intersects every new one and an unguarded change would skip the joint.
+    /// After observing and authorizing the committed joint configuration, use
+    /// `ChangeMembers::AddVoterIds(Default::default())` with a fresh guard to finalize it.
+    /// Retain the original expected leader identity when refreshing membership snapshots.
+    ///
+    /// The forced joint step applies when the effective membership is a uniform built-in
+    /// `Membership`. From a joint configuration, finalizing or reverting yields that uniform
+    /// configuration; any other voter target follows the unguarded transition rules and may land on
+    /// a uniform configuration directly. With a custom `C::Membership`, guarded changes also follow
+    /// the unguarded rules.
+    ///
+    /// Use this, not [`change_membership_if`](Self::change_membership_if), to authorize against
+    /// exact memberships: its preconditions compare log IDs, not complete configurations, and it
+    /// proposes both steps.
+    ///
+    /// # Errors
+    /// Returns `GuardRequired` without a guard under `RequireGuard`, and `GuardMismatch` without
+    /// appending if any expected identity differs at core dispatch. The guard is checked first;
+    /// existing leader, `UncommittedLeaderLog`, membership validation, and fatal errors retain
+    /// their usual meanings.
+    #[openraft_macros::since(version = "0.10.0", change = "single-step guarded membership append")]
+    #[tracing::instrument(level = "info", skip_all)]
+    pub async fn change_membership_guarded(
+        &self,
+        members: impl Into<MembershipEditOf<C>>,
+        retain: bool,
+        guard: crate::MembershipChangeGuard<C>,
+    ) -> Result<ClientWriteResponse<C>, RaftError<C, ClientWriteError<C>>> {
+        self.management_api().change_membership_guarded(members, retain, guard).await.into_raft_result()
+    }
+
     /// Add a new learner raft node, optionally, blocking until up-to-speed.
     ///
     /// Available when `C::MembershipEdit` implements [`RaftMembershipEditOps`] for `C::Membership`.

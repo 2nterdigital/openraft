@@ -17,6 +17,9 @@ pub(crate) mod snapshot_transmitter_handle;
 pub(crate) mod stream_context;
 pub(crate) mod stream_state;
 
+#[cfg(test)]
+mod drain_events_test;
+
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -538,40 +541,51 @@ where
     ///
     /// - For log entries: sets `inflight_id = Some(id)` and `next_action = Some(payload)`
     /// - For committed update: sets `inflight_id = None` and `next_action =
-    ///   Some(empty_range_payload)`
+    ///   Some(empty_range_payload)` (only if `Config::broadcast_commit`; otherwise it records the
+    ///   commit and keeps waiting)
     ///
     /// It blocks until at least one event is received.
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn drain_events(&mut self) -> Result<(), ReplicationClosed> {
         tracing::debug!("drain_events");
 
-        let entries = self.event_watcher.replicate_rx.changed();
-        let committed = self.event_watcher.committed_rx.changed();
+        loop {
+            let entries = self.event_watcher.replicate_rx.changed();
+            let committed = self.event_watcher.committed_rx.changed();
 
-        let selected = C::select2(entries, committed).await;
-        match selected {
-            Select2::First(entries_res) => {
-                entries_res.map_err(|_e| ReplicationClosed::new("replicate_rx closed"))?;
-                // This read delivers the command: `borrow_and_update()` marks it as seen so a
-                // value arriving after `changed()` resolved is not delivered a second time.
-                let data = self.event_watcher.replicate_rx.borrow_and_update().clone();
-                self.inflight_id = Some(data.inflight_id);
-                self.next_action = Some(data.payload);
-            }
-            Select2::Second(committed_res) => {
-                committed_res.map_err(|_e| ReplicationClosed::new("committed_rx closed"))?;
+            let selected = C::select2(entries, committed).await;
+            match selected {
+                Select2::First(entries_res) => {
+                    entries_res.map_err(|_e| ReplicationClosed::new("replicate_rx closed"))?;
+                    // This read delivers the command: `borrow_and_update()` marks it as seen so a
+                    // value arriving after `changed()` resolved is not delivered a second time.
+                    let data = self.event_watcher.replicate_rx.borrow_and_update().clone();
+                    self.inflight_id = Some(data.inflight_id);
+                    self.next_action = Some(data.payload);
+                }
+                Select2::Second(committed_res) => {
+                    committed_res.map_err(|_e| ReplicationClosed::new("committed_rx closed"))?;
 
-                // Committed update: create an empty-range payload to sync commit index.
-                // This read delivers the event, thus it marks the value as seen.
-                let committed = self.event_watcher.committed_rx.borrow_and_update().clone();
-                self.replication_progress.local_committed = committed;
+                    // This read delivers the event, thus it marks the value as seen.
+                    let committed = self.event_watcher.committed_rx.borrow_and_update().clone();
+                    self.replication_progress.local_committed = committed;
 
-                let m = self.replication_progress.remote_matched.clone();
-                let log_id_range = LogIdRange::new(m.clone(), m);
-                self.inflight_id = None;
-                self.next_action = Some(Payload::Probe { log_id_range });
-            }
-        };
+                    if !self.replication_context.config.broadcast_commit {
+                        // Commit alone is delivered by the next data append or heartbeat.
+                        // The unselected `replicate_rx.changed()` is dropped unresolved, so a
+                        // command that arrived meanwhile stays unseen for the next round.
+                        continue;
+                    }
+
+                    // Committed update: create an empty-range payload to sync commit index.
+                    let m = self.replication_progress.remote_matched.clone();
+                    let log_id_range = LogIdRange::new(m.clone(), m);
+                    self.inflight_id = None;
+                    self.next_action = Some(Payload::Probe { log_id_range });
+                }
+            };
+            break;
+        }
 
         tracing::debug!(
             "drain_events set: inflight_id={:?}, next_action={:?}",

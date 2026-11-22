@@ -50,6 +50,7 @@ pub(crate) struct Defaults {
     pub backoff: &'static str,
     pub enable_tick: bool,
     pub enable_heartbeat: bool,
+    pub broadcast_commit: bool,
     pub enable_elect: bool,
     pub removed_leader_step_down: StepDownPolicy,
     pub quorum_loss_probe_interval: Option<u64>,
@@ -78,6 +79,7 @@ pub(crate) const DEFAULTS: Defaults = Defaults {
     backoff: "200ms",
     enable_tick: true,
     enable_heartbeat: true,
+    broadcast_commit: true,
     enable_elect: true,
     removed_leader_step_down: StepDownPolicy::After(150),
     quorum_loss_probe_interval: None,
@@ -89,6 +91,13 @@ pub(crate) const DEFAULTS: Defaults = Defaults {
 #[cfg(feature = "serde")]
 fn default_removed_leader_step_down() -> StepDownPolicy {
     DEFAULTS.removed_leader_step_down.clone()
+}
+
+/// The serde default for [`Config::broadcast_commit`], so that config files written before this
+/// field existed keep the default behavior instead of `bool::default()`.
+#[cfg(feature = "serde")]
+fn default_broadcast_commit() -> bool {
+    DEFAULTS.broadcast_commit
 }
 
 /// Log compaction and snapshot policy.
@@ -431,6 +440,41 @@ pub struct Config {
     ))]
     pub enable_heartbeat: bool,
 
+    /// Whether a leader sends an AppendEntries to a follower when only the commit index advanced.
+    ///
+    /// When `true` (the default), every commit-index advance is pushed to followers immediately,
+    /// with an entry-less AppendEntries if there are no new log entries to send.
+    ///
+    /// When `false`, a commit-index advance alone does not trigger an AppendEntries. Followers
+    /// learn the new commit index from the next AppendEntries carrying log entries, or from the
+    /// next heartbeat. This trades follower commit/apply latency for fewer RPCs. Once writes
+    /// stop, the last commit reaches every follower within about
+    /// `heartbeat_interval + heartbeat_min_interval` plus one RPC: heartbeat suppression skips a
+    /// follower only while it has acked an RPC sent less than `heartbeat_min_interval` ago, and
+    /// every RPC carries the commit index read when it is sent.
+    ///
+    /// With [`enable_relaxed_read`](Self::enable_relaxed_read), the applied bound a leader sends
+    /// again after its state machine applies more entries is delayed the same way.
+    ///
+    /// **Important**: automatic heartbeats must stay enabled (`enable_tick` and
+    /// `enable_heartbeat`), or followers may never learn the commit index of the last written
+    /// entries. [`validate()`](Self::validate) rejects `false` together with either of them
+    /// disabled, including when the application drives heartbeats with
+    /// [`Trigger::tick`](crate::raft::trigger::Trigger::tick) or
+    /// [`Trigger::heartbeat`](crate::raft::trigger::Trigger::heartbeat). Turning heartbeat off at
+    /// runtime has the same effect and is not checked.
+    #[since(version = "0.10.1")]
+    // clap 4 requires `num_args = 0..=1`, or it complains about missing arg error
+    // https://github.com/clap-rs/clap/discussions/4374
+    #[cfg_attr(feature = "clap", clap(long,
+           default_value_t = true,
+           action = clap::ArgAction::Set,
+           num_args = 0..=1,
+           default_missing_value = "true"
+    ))]
+    #[cfg_attr(feature = "serde", serde(default = "default_broadcast_commit"))]
+    pub broadcast_commit: bool,
+
     /// Whether a follower will enter candidate state if it does not receive any messages from the
     /// leader for a while.
     ///
@@ -759,6 +803,7 @@ impl Default for Config {
             broadcast_submitted_on_append: None,
             enable_tick: DEFAULTS.enable_tick,
             enable_heartbeat: DEFAULTS.enable_heartbeat,
+            broadcast_commit: DEFAULTS.broadcast_commit,
             enable_elect: DEFAULTS.enable_elect,
             enable_local_lease_read: None,
             enable_relaxed_read: None,
@@ -932,6 +977,12 @@ impl Config {
 
         if self.max_payload_entries == 0 {
             return Err(ConfigError::MaxPayloadIs0);
+        }
+
+        // Only a leader with both switches on arms its heartbeat deadline; see
+        // `RaftCore::heartbeat_wake_at()`. Without it, nothing delivers the last commit.
+        if !self.broadcast_commit && (!self.enable_tick || !self.enable_heartbeat) {
+            return Err(ConfigError::BroadcastCommitWithoutHeartbeat);
         }
 
         if let Some(probe_interval) = self.quorum_loss_probe_interval {

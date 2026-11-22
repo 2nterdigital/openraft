@@ -123,19 +123,24 @@ where
 
     /// Grant the vote by a node.
     pub(crate) fn grant_by(&mut self, target: &C::NodeId) -> bool {
+        self.grant_by_with_status(target).0
+    }
+
+    /// Native tally result and whether the target was actually consumed by that tally.
+    pub(crate) fn grant_by_with_status(&mut self, target: &C::NodeId) -> (bool, bool) {
         let Some(granted) = self.progress.update_progress(target, true) else {
             tracing::warn!(
                 "{}: ignore vote from target not in quorum set: {}",
                 func_name!(),
                 target
             );
-            return false;
+            return (false, false);
         };
         let granted = *granted;
 
         tracing::info!("{}: voting: {}", func_name!(), self);
 
-        granted
+        (granted, true)
     }
 
     /// Return the node ids that have granted this vote.

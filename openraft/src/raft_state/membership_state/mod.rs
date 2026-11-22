@@ -129,6 +129,20 @@ where
         self.effective.is_campaigner(id) || self.committed.is_campaigner(id)
     }
 
+    /// [`Self::next_membership_with`] that takes every allowed direct transition.
+    #[cfg(test)]
+    pub(crate) fn next_membership<Edit, E>(
+        &self,
+        change: Edit,
+        retain: bool,
+    ) -> Result<(Mem, Option<Mem>), ChangeMembershipError<CLID, Mem::NodeId, E>>
+    where
+        Edit: RaftMembershipEdit<Mem>,
+        E: ErrorSource,
+    {
+        self.next_membership_with(change, retain, false)
+    }
+
     /// Builds a new membership configuration by applying changes to the current configuration.
     ///
     /// It returns the target of `change` when `supports_direct_transition_to()` holds from the
@@ -154,10 +168,18 @@ where
     ///
     /// This function ensures that the cluster will have at least one voter in the new membership
     /// configuration.
-    pub(crate) fn next_membership<Edit, E>(
+    ///
+    /// With `force_joint`, a voter change that starts from a uniform built-in [`Membership`] always
+    /// returns the joint step, even when a direct transition is allowed: a guarded change appends
+    /// exactly one step and its caller authorizes the committed joint before finalizing it.
+    /// Leaving a joint, and a change that keeps the voter sets, stay direct.
+    ///
+    /// [`Membership`]: crate::Membership
+    pub(crate) fn next_membership_with<Edit, E>(
         &self,
         change: Edit,
         retain: bool,
+        force_joint: bool,
     ) -> Result<(Mem, Option<Mem>), ChangeMembershipError<CLID, Mem::NodeId, E>>
     where
         Edit: RaftMembershipEdit<Mem>,
@@ -173,7 +195,8 @@ where
         goal.ensure_voters_have_nodes().map_err(MembershipError::<_, E>::from)?;
         goal.ensure_write_voters_receive_logs()?;
         goal.ensure_read_write_quorums_intersect()?;
-        if effective.allows_direct_transition_to(&goal) {
+        let joint_required = force_joint && enters_joint(effective, &goal);
+        if !joint_required && effective.allows_direct_transition_to(&goal) {
             return Ok((goal, None));
         }
 
@@ -390,6 +413,25 @@ where
     pub fn effective(&self) -> &Arc<StoredMembership<CLID, Mem>> {
         &self.effective
     }
+}
+
+/// Whether `from -> goal` changes the voters of a uniform built-in [`Membership`].
+///
+/// shortcut: only the built-in `Membership` exposes its joint configs; a custom membership returns
+/// `false` and keeps the upstream direct transition. Upgrade when `RaftMembership` can tell joint
+/// from uniform.
+///
+/// [`Membership`]: crate::Membership
+fn enters_joint<Mem>(from: &Mem, goal: &Mem) -> bool
+where Mem: RaftMembership {
+    type Builtin<M> = crate::Membership<<M as RaftMembership>::NodeId, <M as RaftMembership>::Node>;
+    let from = (from as &dyn std::any::Any).downcast_ref::<Builtin<Mem>>();
+    let goal = (goal as &dyn std::any::Any).downcast_ref::<Builtin<Mem>>();
+    let (Some(from), Some(goal)) = (from, goal) else {
+        return false;
+    };
+    let from = from.get_joint_config();
+    from.len() == 1 && from != goal.get_joint_config()
 }
 
 impl<CLID, Mem> Validate for MembershipState<CLID, Mem>

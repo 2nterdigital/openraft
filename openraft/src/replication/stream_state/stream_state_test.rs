@@ -286,3 +286,87 @@ fn stale_stream_does_not_mix_votes_and_later_commits() {
         }
     });
 }
+
+/// With `broadcast_commit = false`, a commit change alone does not wake an idle `LogsSince`
+/// stream, and it does not hide the next submitted log: that request carries the new commit.
+/// With `true`, the same commit change produces an entry-less request at once.
+#[test]
+fn commit_only_change_follows_broadcast_commit() {
+    const PENDING: Duration = Duration::from_millis(100);
+
+    UTConfig::<()>::run(async {
+        for broadcast_commit in [true, false] {
+            let vote = VoteOf::<UTConfig>::new_committed(1, 1).to_committed();
+            let prev = Some(log_id(1, 1, 5));
+            let new_commit = Some(log_id(1, 1, 5));
+
+            let inflight_id = InflightId::new(1);
+            let replicate = Replicate::new_logs_since(prev, inflight_id);
+            let (_replicate_tx, replicate_rx) = UTConfig::<()>::watch_channel(replicate);
+            let (committed_tx, committed_rx) = UTConfig::<()>::watch_channel(Some(log_id(1, 1, 4)));
+            let (io_tx, io_rx) = UTConfig::<()>::watch_channel(IOId::new_log_io(vote.clone(), prev));
+            let (_cancel_tx, cancel_rx) = UTConfig::<()>::watch_channel(());
+            let (_backoff_reset_tx, backoff_reset_rx) = UTConfig::<()>::watch_channel(());
+            let (_probe_tx, quorum_loss_probe_rx) = UTConfig::<()>::watch_channel(None);
+            let (tx_notify, _rx_notify) = UTConfig::<()>::mpsc(1);
+
+            let mut state = StreamState::<UTConfig, PrefixStore> {
+                replication_context: ReplicationContext {
+                    id: 1,
+                    target: 2,
+                    leader_vote: vote.clone(),
+                    stream_id: StreamId::new(1),
+                    config: Arc::new(Config {
+                        broadcast_commit,
+                        ..Default::default()
+                    }),
+                    tx_notify,
+                    cancel_rx,
+                    replicate_batch: SharedReplicateBatch::new(),
+                    quorum_loss_probe_rx,
+                },
+                event_watcher: EventWatcher {
+                    replicate_rx,
+                    committed_rx,
+                    io_accepted_rx: io_rx.clone(),
+                    io_submitted_rx: io_rx,
+                },
+                log_reader: PrefixStore {
+                    empty_first: false,
+                    reads: vec![],
+                },
+                payload: Some(Payload::LogsSince { prev }),
+                inflight_id: Some(inflight_id),
+                backoff_consumer: BackoffState::new().consumer(backoff_reset_rx),
+                after_leader_check: None,
+            };
+
+            tracing::info!(broadcast_commit, "--- only the commit advances");
+            assert!(committed_tx.send_if_greater(new_commit));
+            let res = UTConfig::<()>::timeout(PENDING, state.next_request()).await;
+
+            if broadcast_commit {
+                let request = res.expect("a commit-only change sends a request").unwrap().unwrap();
+                assert_eq!(prev, request.prev_log_id);
+                assert!(request.entries.is_empty());
+                assert_eq!(new_commit, request.leader_commit);
+                continue;
+            }
+
+            assert!(res.is_err(), "a commit-only change must not send a request: {res:?}");
+            assert!(state.log_reader.reads.is_empty());
+
+            tracing::info!("--- a submitted log is still delivered and carries the latest commit");
+            let last = Some(log_id(1, 1, 6));
+            assert!(io_tx.send_if_greater(IOId::new_log_io(vote, last)));
+            let request = UTConfig::<()>::timeout(PENDING, state.next_request())
+                .await
+                .expect("a submitted log must wake the stream")
+                .unwrap()
+                .unwrap();
+            assert_eq!(prev, request.prev_log_id);
+            assert_eq!(vec![EntryOf::<UTConfig>::new_blank(log_id(1, 1, 6))], request.entries);
+            assert_eq!(new_commit, request.leader_commit);
+        }
+    });
+}

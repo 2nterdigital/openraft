@@ -183,11 +183,12 @@ fn apply_membership_to_payload<C>(
     changes: MembershipEditOf<C>,
     retain: bool,
     payloads: MembershipPayloads<C>,
+    force_joint: bool,
 ) -> Result<C::Payload, ChangeMembershipErrorOf<C>>
 where
     C: RaftTypeConfig,
 {
-    let (membership, target) = membership_state.next_membership(changes, retain)?;
+    let (membership, target) = membership_state.next_membership_with(changes, retain, force_joint)?;
     let payload = payloads.select(membership, target);
     Ok(payload)
 }
@@ -208,6 +209,8 @@ where
     pub(crate) config: Arc<Config>,
 
     pub(crate) runtime_config: Arc<RuntimeConfig>,
+
+    pub(crate) membership_policy: crate::MembershipChangePolicy,
 
     /// Additional state that does not directly affect the consensus.
     pub(crate) core_state: CoreState<C>,
@@ -497,10 +500,17 @@ where
         &mut self,
         changes: MembershipEditOf<C>,
         retain: bool,
+        guard: Option<crate::MembershipChangeGuard<C>>,
         preconditions: BatchOf<C, Precondition<C>>,
         payloads: MembershipPayloads<C>,
         tx: ProgressResponder<C, ClientWriteResult<C>>,
     ) {
+        // No await or dispatch occurs between authorization and the membership append below.
+        if let Err(e) = self.check_membership_guard(guard.as_ref()) {
+            tx.on_complete(Err(ClientWriteError::ChangeMembershipError(e)));
+            return;
+        }
+
         let lh = match self.ensure_writable_leader_handler() {
             Ok(lh) => lh,
             Err(e) => {
@@ -522,7 +532,15 @@ where
             return;
         }
 
-        let res = apply_membership_to_payload::<C>(&self.engine.state.membership_state, changes, retain, payloads);
+        // A guarded voter change appends exactly its joint step; see `next_membership_with()`.
+        let force_joint = guard.is_some();
+        let res = apply_membership_to_payload::<C>(
+            &self.engine.state.membership_state,
+            changes,
+            retain,
+            payloads,
+            force_joint,
+        );
         let payload = match res {
             Ok(x) => x,
             Err(e) => {
@@ -554,6 +572,12 @@ where
         preconditions: BatchOf<C, Precondition<C>>,
         tx: ProgressResponder<C, ClientWriteResult<C>>,
     ) {
+        // `append_membership()` has no guarded form, so `RequireGuard` rejects every call.
+        if let Err(e) = self.check_membership_guard(None) {
+            tx.on_complete(Err(ClientWriteError::ChangeMembershipError(e)));
+            return;
+        }
+
         let lh = match self.ensure_writable_leader_handler() {
             Ok(lh) => lh,
             Err(forward) => {
@@ -686,6 +710,35 @@ where
             self_quorum,
         };
         Some(state)
+    }
+
+    /// Authorize a membership append against [`MembershipChangePolicy`] and an optional guard.
+    ///
+    /// Without a guard, `RequireGuard` rejects with `GuardRequired`. A guard passes only if the
+    /// committed leader of the local vote, and the exact committed and effective memberships,
+    /// equal what it expects; otherwise it rejects with `GuardMismatch`. It reads state
+    /// synchronously, so the caller must append in the same call, with no await in between.
+    ///
+    /// [`MembershipChangePolicy`]: crate::MembershipChangePolicy
+    fn check_membership_guard(
+        &self,
+        guard: Option<&crate::MembershipChangeGuard<C>>,
+    ) -> Result<(), ChangeMembershipErrorOf<C>> {
+        let Some(guard) = guard else {
+            if self.membership_policy == crate::MembershipChangePolicy::RequireGuard {
+                return Err(crate::errors::ChangeMembershipError::GuardRequired);
+            }
+            return Ok(());
+        };
+
+        let state = &self.engine.state;
+        let matches = state.vote_ref().try_to_committed_leader_id().as_ref() == Some(&guard.expected_leader)
+            && state.membership_state.committed().as_ref() == &guard.committed
+            && state.membership_state.effective().as_ref() == &guard.effective;
+        if !matches {
+            return Err(crate::errors::ChangeMembershipError::GuardMismatch);
+        }
+        Ok(())
     }
 
     /// Ensure this node has a valid leader lease and may accept new writes.
@@ -995,7 +1048,7 @@ where
 
         if !has_error {
             // With the new config, start to elect to become leader
-            self.engine.elect();
+            self.engine.elect_with_origin(crate::election_observer::CampaignOrigin::Initialize);
         }
     }
 
@@ -1909,6 +1962,7 @@ where
                 self.handle_initialize(members, tx);
             }
             RaftMsg::ChangeMembership {
+                guard,
                 changes,
                 payloads,
                 retain,
@@ -1923,7 +1977,7 @@ where
                     preconditions.as_ref().display()
                 );
 
-                self.change_membership(changes, retain, preconditions, payloads, tx);
+                self.change_membership(changes, retain, guard, preconditions, payloads, tx);
             }
             RaftMsg::AppendMembership {
                 payload,
@@ -2080,7 +2134,7 @@ where
                 // started a due election, within the same call.
                 // TODO: remove this call in a later release and leave elections to the deadline
                 // notifier.
-                self.elect_if_due();
+                self.elect_if_due(crate::election_observer::CampaignOrigin::ExternalElect);
             }
         }
     }
@@ -2122,7 +2176,25 @@ where
                     let my_vote = self.engine.candidate_ref().map(|x| x.vote_ref());
                     if Self::does_vote_match("Candidate", &candidate_vote, my_vote, "VoteResponse") {
                         self.engine.handle_vote_resp(target, resp);
+                    } else {
+                        self.engine.observe_ignored_response(
+                            Some(now),
+                            crate::election_observer::CampaignPhase::Vote,
+                            &target,
+                            &candidate_vote,
+                            &resp,
+                            crate::election_observer::VoteResponseDisposition::IgnoredStaleCampaign,
+                        );
                     }
+                } else {
+                    self.engine.observe_ignored_response(
+                        Some(now),
+                        crate::election_observer::CampaignPhase::Vote,
+                        &target,
+                        &candidate_vote,
+                        &resp,
+                        crate::election_observer::VoteResponseDisposition::IgnoredNoCampaign,
+                    );
                 }
             }
 
@@ -2142,7 +2214,25 @@ where
                     let my_vote = self.engine.pre_candidate_ref().map(|x| x.vote_ref());
                     if Self::does_vote_match("Pre-Candidate", &candidate_vote, my_vote, "PreVoteResponse") {
                         self.engine.handle_pre_vote_resp(target, resp);
+                    } else {
+                        self.engine.observe_ignored_response(
+                            None,
+                            crate::election_observer::CampaignPhase::PreVote,
+                            &target,
+                            &candidate_vote,
+                            &resp,
+                            crate::election_observer::VoteResponseDisposition::IgnoredStaleCampaign,
+                        );
                     }
+                } else {
+                    self.engine.observe_ignored_response(
+                        None,
+                        crate::election_observer::CampaignPhase::PreVote,
+                        &target,
+                        &candidate_vote,
+                        &resp,
+                        crate::election_observer::VoteResponseDisposition::IgnoredNoCampaign,
+                    );
                 }
             }
 
@@ -2200,7 +2290,9 @@ where
 
             Notification::StateMachine { command_result } => self.handle_state_machine_result(command_result)?,
             Notification::PendingReadDeadlineReached => self.process_pending_reads(),
-            Notification::ElectionDeadlineReached => self.elect_if_due(),
+            Notification::ElectionDeadlineReached => {
+                self.elect_if_due(crate::election_observer::CampaignOrigin::AutomaticTimeout)
+            }
         };
         Ok(())
     }
@@ -2406,11 +2498,18 @@ where
     /// It handles [`Notification::ElectionDeadlineReached`], and runs for
     /// [`ExternalCommand::Tick`]. The notification may have been sent for a deadline that has
     /// since moved, or before this node changed role or elections were disabled, so
-    /// [`Engine::elect_if_due`] checks every condition again.
-    fn elect_if_due(&mut self) {
+    /// [`Engine::elect_if_due_with_origin`] checks every condition again.
+    ///
+    /// `origin` is reported only to the election observer: the deadline notifier starts an
+    /// [`CampaignOrigin::AutomaticTimeout`] campaign, a manual tick an
+    /// [`CampaignOrigin::ExternalElect`] one.
+    ///
+    /// [`CampaignOrigin::AutomaticTimeout`]: crate::election_observer::CampaignOrigin::AutomaticTimeout
+    /// [`CampaignOrigin::ExternalElect`]: crate::election_observer::CampaignOrigin::ExternalElect
+    fn elect_if_due(&mut self, origin: crate::election_observer::CampaignOrigin) {
         let enable_elect = self.runtime_config.enable_elect.load(Ordering::Relaxed);
         let enable_pre_vote = self.runtime_config.enable_pre_vote.load(Ordering::Relaxed);
-        self.engine.elect_if_due(C::now(), enable_elect, enable_pre_vote);
+        self.engine.elect_if_due_with_origin(C::now(), enable_elect, enable_pre_vote, origin);
     }
 
     /// If a message is sent under a vote that this node no longer holds, it is a stale message
@@ -3034,7 +3133,7 @@ mod tests {
 
         let payloads = MembershipPayloads::<TestConfig>::Uniform(payload);
         let changes = ChangeMembers::AddNodes(btreemap! {2 => ()});
-        let result = apply_membership_to_payload::<TestConfig>(&membership_state, changes, false, payloads);
+        let result = apply_membership_to_payload::<TestConfig>(&membership_state, changes, false, payloads, false);
         let actual = result.unwrap();
 
         let expected_membership = Membership::new_with_defaults(vec![btreeset! {1}], btreeset! {2});
@@ -3053,7 +3152,7 @@ mod tests {
 
         let payloads = MembershipPayloads::<TestConfig>::Uniform(TestPayload::blank());
         let changes = ChangeMembers::AddNodes(btreemap! {2 => ()});
-        let result = apply_membership_to_payload::<TestConfig>(&membership_state, changes, false, payloads);
+        let result = apply_membership_to_payload::<TestConfig>(&membership_state, changes, false, payloads, false);
         let actual = result.unwrap();
 
         let expected_membership = Membership::new_with_defaults(vec![btreeset! {1}], btreeset! {2});
@@ -3080,7 +3179,7 @@ mod tests {
         };
 
         let changes = ChangeMembers::ReplaceAllVoters(btreeset! {3, 4, 5});
-        let result = apply_membership_to_payload::<TestConfig>(&membership_state, changes, false, payloads);
+        let result = apply_membership_to_payload::<TestConfig>(&membership_state, changes, false, payloads, false);
         let actual = result.unwrap();
 
         let joint_membership = Membership::new_with_defaults(vec![btreeset! {1, 2, 3}, btreeset! {3, 4, 5}], []);
@@ -3116,7 +3215,7 @@ mod tests {
         };
 
         let changes = ChangeMembers::AddNodes(btreemap! {2 => ()});
-        let result = apply_membership_to_payload::<TestConfig>(&membership_state, changes, false, payloads);
+        let result = apply_membership_to_payload::<TestConfig>(&membership_state, changes, false, payloads, false);
         let actual = result.unwrap();
 
         let expected_membership = Membership::new_with_defaults(vec![btreeset! {1}], btreeset! {2});

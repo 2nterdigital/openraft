@@ -94,6 +94,7 @@ where C: RaftTypeConfig
     },
 
     ChangeMembership {
+        guard: Option<crate::MembershipChangeGuard<C>>,
         changes: MembershipEditOf<C>,
 
         /// Payloads whose membership OpenRaft replaces with the computed membership.

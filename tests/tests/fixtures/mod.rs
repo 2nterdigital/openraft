@@ -436,6 +436,42 @@ impl RaftRouter {
         nodes.remove(&id)
     }
 
+    /// Construct through the independent public observer API using the existing real RPC router.
+    pub async fn new_raft_node_with_election_observer(
+        &mut self,
+        id: MemNodeId,
+        observer: Arc<dyn openraft::election_observer::ElectionObserver<MemConfig>>,
+    ) {
+        self.new_raft_node_with_policy(id, Some(observer), openraft::MembershipChangePolicy::Unrestricted)
+            .await;
+    }
+
+    /// Construct with an election observer and a membership authorization policy.
+    pub async fn new_raft_node_with_policy(
+        &mut self,
+        id: MemNodeId,
+        observer: Option<Arc<dyn openraft::election_observer::ElectionObserver<MemConfig>>>,
+        membership_policy: openraft::MembershipChangePolicy,
+    ) {
+        let (log_store, sm) = self.new_store();
+        let node = Raft::new_with_election_observer_and_membership_policy(
+            id,
+            self.config.clone(),
+            self.clone(),
+            log_store.clone(),
+            sm.clone(),
+            observer,
+            membership_policy,
+        )
+        .await
+        .unwrap();
+        self.nodes.lock().unwrap().insert(id, Node {
+            raft: node,
+            log_store,
+            state_machine: sm,
+        });
+    }
+
     /// Stop a node and retain its handle and stores without healing its network.
     pub async fn stop_node(&mut self, id: MemNodeId) -> anyhow::Result<Node> {
         let detached = self.detach_node(id);
